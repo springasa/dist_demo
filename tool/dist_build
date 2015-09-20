@@ -1,0 +1,662 @@
+#!/usr/bin/env python
+#  -*- mode: python; -*-
+
+import BatchRun
+import os
+import time
+import sys
+import threading
+import socket
+import paramiko
+import logging
+import stat
+import ConfigParser
+import xmlrpclib
+import re
+try:
+	import curses
+except ImportError:
+	curses = None
+import traceback
+from optparse import OptionParser
+
+graphics_draw = None
+
+class Maker(BatchRun.Runner):
+	def cmd(self):
+		return ['make', self.task, '-C', dir_make, '--jobserver-fds=%s' % ','.join(map(lambda x: '%d' % x, jobserver)), '-j']
+		
+	def on_start(self):
+		if graphics_draw:
+			graphics_draw()
+		
+	def on_stop(self, returncode):
+		if graphics_draw:
+			graphics_draw()
+		else:
+			if returncode == 0:
+				out = (sys.stdout, 'complete')
+			else:
+				out = (sys.stderr, 'error')
+			out[0].write('%-72s %s\n' % (self.task, out[1]))
+		
+	@staticmethod
+	def outlog(task):
+		return os.path.join(dir_log, '%s.log' % task.replace('/', '__'))
+		
+	@staticmethod
+	def errlog(task):
+		return os.path.join(dir_log, 'error_%s.log' % task.replace('/', '__'))
+
+def CreateRemoteGitMaker(parent_pool):
+	class RemoteTask(object):
+		def __init__(self, cmd):
+			self.cmd = cmd
+			self.id = None
+		def start(self):
+			self.id = parent_pool.remote.start(self.cmd)
+			return self.id
+		def poll(self):
+			return parent_pool.remote.poll(self.id)
+		def name(self):
+			return self.cmd
+	class LocalTask(object):
+		def __init__(self, func):
+			def run():
+				self.returncode = func()
+			self.name = func.func_name
+			self.returncode = None
+			self.func = run
+			self.threading = None
+		def start(self):
+			self.threading = threading.Thread(target = self.func)
+			self.threading.start()
+			return self.threading
+		def poll(self):
+			return self.returncode
+		def name(self):
+			self.name
+
+	class RemoteMaker(object):
+		def __init__(self, task):
+			self.task = task
+			# only for main task
+			self.returncode = 0
+			self.subtask = []
+			self.current_subtask = None
+			# aux task fail or remote disconnected
+			self.abort = False
+			
+		def aborted(self):
+			return self.abort
+
+		def cmd(self):
+			return ['make', self.task, '-C', dir_make]
+
+		def sync(self):
+			expect_file = parent_pool.file_mgmt.copy()
+			parent_pool.serial_upload.acquire()
+
+			remote_file = parent_pool.remote_file_copy()
+
+			download_file_path = filter(lambda path: not path in remote_file, expect_file.keys())
+
+			if len(download_file_path) > 0:
+				client = paramiko.client.SSHClient()
+				client.load_system_host_keys()
+				client.set_missing_host_key_policy(paramiko.client.AutoAddPolicy())
+				client.connect(parent_pool.remote.addr[0], port = parent_pool.remote.addr[1], username = parent_pool.remote.user, password = parent_pool.remote.password)
+				sftp = client.open_sftp()
+				for path in download_file_path:
+					local = path
+					local_dir = os.path.split(local)[0]
+					remote = os.path.join('dist_build', parent_pool.git_dir, local)
+					# put file to remote node
+					parent_pool.remote.mkdir(local_dir)
+					logging.debug('[%s] download %s' % (parent_pool.remote.addr[0], local))
+					sftp.put(local, remote)
+					# update remote file list
+					parent_pool.remote_file_add([(path, expect_file[path]),])
+				sftp.close()
+				client.close()
+
+			parent_pool.serial_upload.release()
+			return 0
+
+		def upload(self):
+			fail = 0
+			success = []
+			files = parent_pool.file_mgmt.generated(self.task)
+
+			client = paramiko.client.SSHClient()
+			client.load_system_host_keys()
+			client.set_missing_host_key_policy(paramiko.client.AutoAddPolicy())
+			client.connect(parent_pool.remote.addr[0], port = parent_pool.remote.addr[1], username = parent_pool.remote.user, password = parent_pool.remote.password)
+			
+			sftp = client.open_sftp()
+			for fil in files:
+				local = fil
+				remote = os.path.join('dist_build', parent_pool.git_dir, local)
+				local_dir = os.path.split(local)[0]
+				if not os.path.exists(local_dir):
+					os.makedirs(local_dir)
+				logging.debug('[%s] upload %s' % (parent_pool.remote.addr[0], local))
+				sftp.get(remote, local)
+				success.append((local, {'time': time.time()}))
+			sftp.close()
+
+			client.close()
+
+			parent_pool.remote_file_add(success)
+			parent_pool.file_mgmt.add(success)
+
+			return fail
+
+		def start(self):
+			def subtask(task, returncode):
+				return dict(zip(['task', 'returncode'], [task, returncode]))
+			def main(cmd):
+				def returncode(r):
+					self.returncode = r
+				return subtask(cmd, returncode)
+			def aux(cmd):
+				def returncode(r):
+					self.abort |= (r != 0)
+				return subtask(cmd, returncode)
+			
+			if len(self.subtask) == 0:
+				def idle():
+					return 0
+				self.subtask = [
+					aux(LocalTask(self.sync)), # update object
+					main(RemoteTask(' '.join(self.cmd()))),
+					aux(LocalTask(self.upload)), # submit new object
+					]
+				self.start_subtask()
+				return self
+				
+		def start_subtask(self):
+			subtask = self.subtask[0]['task']
+			if None == subtask.start():
+				self.abort = False
+			
+		def poll(self):
+			# update result
+			if not self.abort and len(self.subtask) > 0:
+				subtask = self.subtask[0]['task']			
+				rcode = subtask.poll()
+				if rcode != None:
+					subtask = self.subtask.pop(0)
+					subtask['returncode'](rcode)
+					if self.abort:
+						logging.error('abort - %s - %s' % (self.task, subtask.name()))
+					if rcode == 0 and len(self.subtask) > 0:
+						self.start_subtask()
+			
+			# return result
+			if not self.abort and len(self.subtask) == 0:
+				return self.returncode
+			
+	return RemoteMaker
+	
+class RemoteNode(object):
+	def __init__(self, (adr, usr, pwd)):
+		self.addr = adr
+		self.user = usr
+		self.password = pwd
+		self.proxy = xmlrpclib.ServerProxy('http://%s:8000/' % self.addr[0])
+		self.deploy = True
+		
+	def online(self):
+		return self.deploy
+		
+	def dist_start(self, host, usr = None, pwd = None):
+		REMOTE_FILE = '.dist_%s'
+		REMOTE_ENTRY = 'remote'
+		REMOTE_LOG = REMOTE_FILE % 'out.log'
+		REMOTE_ERR = REMOTE_FILE % 'error.log'
+		client = paramiko.client.SSHClient()
+		client.load_system_host_keys()
+		client.set_missing_host_key_policy(paramiko.client.AutoAddPolicy())
+		client.connect(host[0], port = host[1], username = usr, password = pwd)
+		
+		sftp = client.open_sftp()
+		local = os.path.split(os.path.realpath(__file__))[0]
+		sftp.put(os.path.join(local, REMOTE_ENTRY), REMOTE_ENTRY)
+		sftp.chmod(REMOTE_ENTRY, stat.S_IRWXU)
+		sftp.close()
+		
+		stdin, stdout, stderr = client.exec_command('./%s 1>%s 2>%s' % (REMOTE_ENTRY, REMOTE_LOG, REMOTE_ERR))
+		client.close()
+		
+	def remote_unreach(self):
+		if self.deploy:
+			self.deploy = False
+			def daemon():
+				while not self.deploy:
+					logging.debug('deploying to %s', self.addr[0])
+					self.dist_start(self.addr, self.user, self.password)
+					time.sleep(1)
+					self.deploy = self.test()
+			t = threading.Thread(target = daemon)
+			t.start()
+			
+	def test(self):
+		try:
+			self.proxy.version()
+		except socket.error as e:
+			return False
+		return True
+		
+	def cpu_count(self):
+		if self.deploy:
+			try:
+				return self.proxy.cpu_count()
+			except socket.error as e:
+				self.remote_unreach()
+		
+	def start(self, cmd):
+		if self.deploy:
+			try:
+				id = self.proxy.start(cmd)
+				logging.debug('start [%d]%s' % (id, cmd))
+				return id
+			except socket.error as e:
+				self.remote_unreach()
+		
+	def poll(self, id):
+		if self.deploy:
+			try:
+				result = self.proxy.poll(id)
+				if result != None:
+					logging.debug('poll [%d]%s' % (id, result))
+				return result
+			except socket.error as e:
+				self.remote_unreach()
+				
+	def chdir(self, path):
+		if self.deploy:
+			try:
+				return self.proxy.chdir(path)
+			except socket.error as e:
+				self.remote_unreach()
+
+	def mkdir(self, path):
+		if self.deploy:
+			try:
+				return self.proxy.mkdir(path)
+			except socket.error as e:
+				self.remote_unreach()
+
+	def set_root(self, path):
+		if self.deploy:
+			try:
+				return self.proxy.set_root(path)
+			except socket.error as e:
+				self.remote_unreach()
+
+class GitMakerPool(object):
+	def __init__(self, file_mgmt, git_repo, git_dir, (adr, usr, pwd)):
+		self.file_mgmt = file_mgmt
+		self.git_repo = git_repo
+		self.git_dir = git_dir
+		self.cloned = False
+		self.cpu_count = None
+		self.idle = 0
+		self.used = []
+		self.host = adr[0]
+		self.remote = RemoteNode((adr, usr, pwd))
+		self.prepare()
+		self.lock = threading.Lock()
+		self.remote_file = {}
+		self.serial_upload = threading.Lock()
+	
+	def prepare(self):
+		def daemon():
+			# test connect and get cpu count
+			while not self.cpu_count:
+				logging.debug('connecting to %s', self.host)
+				self.cpu_count = self.remote.cpu_count()
+				if not self.cpu_count:
+					time.sleep(1)
+			logging.info('connected to %s', self.host)
+		
+			# sync repo
+			if not self.cloned:
+				self.cloned = self.git_clone()
+				if self.cloned:
+					logging.info('clone to %s sucess', self.host)
+				else:
+					logging.error('clone to %s failed', self.host)
+			# start
+			if self.cloned:
+				self.idle = self.cpu_count
+
+		t = threading.Thread(target = daemon)
+		t.start()
+
+	def remote_call(self, cmd):
+		task = self.remote.start(cmd)
+		while None == self.remote.poll(task):
+			time.sleep(1)
+		return self.remote.poll(task)
+
+	def git_clone(self):
+		result = self.remote.chdir('.')
+		# rmdir workspace
+		result = self.remote_call('rm -rf %s' % self.git_dir)
+		# git clone
+		if result == 0:
+			result = self.remote_call('git clone %s %s' % (self.git_repo, self.git_dir))
+			pass
+		# goto workspace
+		if result == 0:
+			result = self.remote.chdir(self.git_dir)
+			self.remote_call('pwd')
+			logging.info('chdir to %s' % self.git_dir)
+		return result == 0
+
+	def empty(self):
+		return self.idle == 0
+
+	def belongs(self, r):
+		return r in self.used
+		
+	def alloc_runner(self, task):
+		if self.idle > 0:
+			self.idle -= 1
+			logging.debug('create git task %s', task)
+			runner = CreateRemoteGitMaker(self)(task)
+			self.used.append(runner)
+			return runner
+		
+	def free_runner(self, r):
+		if self.belongs(r):
+			self.idle += 1
+			logging.debug('remove git task %s', r.task)
+			self.used.remove(r)
+
+	def remote_file_add(self, files):
+		self.lock.acquire()
+		for fil in files:
+			path = fil[0]
+			info = fil[1]
+			self.remote_file[path] = info
+		self.lock.release()
+
+	def remote_file_copy(self):
+		self.lock.acquire()
+		remote_file = self.remote_file.copy()
+		self.lock.release()
+		return remote_file
+
+class LocalMakerPool(object):
+	def __init__(self, max_runner):
+		self.idle = max_runner
+		self.used = []
+	
+	def empty(self):
+		return self.idle == 0
+
+	def belongs(self, r):
+		return r in self.used
+		
+	def alloc_runner(self, task):
+		if self.idle > 0:
+			self.idle -= 1
+			runner = Maker(task)
+			self.used.append(runner)
+			return runner
+		
+	def free_runner(self, r):
+		if self.belongs(r):
+			self.idle += 1
+			self.used.remove(r)
+
+class TargetFileMgmt(object):
+	def __init__(self, target_file):
+		self.lock = threading.Lock()
+		self.target_file = target_file
+		self.files = {}
+
+	def generated(self, target):
+		return self.target_file.get(target, [])
+
+	def add(self, files):
+		self.lock.acquire()
+		for fil in files:
+			path = fil[0]
+			info = fil[1]
+			self.files[path] = info
+		self.lock.release()
+
+	def copy(self):
+		self.lock.acquire()
+		files = self.files.copy()
+		self.lock.release()
+		return files
+
+class MakerPool(object):
+	def __init__(self, generated, max_runner, repo, remote):
+		self.target_file_mgmt = TargetFileMgmt(generated)
+		self.nodes = [
+			#LocalMakerPool(max_runner), 
+		] + [GitMakerPool(self.target_file_mgmt, repo, node['root'], (node['address'], node['user'], node['password'])) for node in remote]
+	
+	def empty(self):
+		#for node in self.nodes:
+		#	print node.empty()
+		return all([node.empty() for node in self.nodes])
+		
+	def alloc_runner(self, task):
+		def alloc_generator():
+			for node in self.nodes:
+				yield node.alloc_runner(task)
+
+		for runner in alloc_generator():
+			if runner:
+				logging.info('new task %s', task)
+				return runner
+		
+	def free_runner(self, r):
+		for node in self.nodes:
+			if node.belongs(r):
+				node.free_runner(r)
+
+
+def read_depend(file):
+	deps = {}
+	for line in file:
+		if ':' in line:
+			task, depend = line.split(':', 1)
+			depend = depend.split()
+			if len(depend) > 0:
+				deps[task] = deps.get(task, []) + depend
+	return deps
+	
+def read_target(file):
+	target = file.read().split()
+	return target
+	
+def expand_depend(target, depend):
+	im_dep_all = sum([depend[t] for t in target if t in depend], [])
+	im_dep_new = list(set([d for d in im_dep_all if not d in target]))
+	return expand_depend(im_dep_new + target, depend) if len(im_dep_new) > 0 else target
+
+def target_filter(except_target):
+	return lambda target: \
+		not any(map(lambda key: key in except_target, target.split('/') + [target,]))
+
+def graphics_test():
+	ok = True
+	try:
+		stdscr = curses.initscr()
+		curses.endwin()
+	except:
+		ok = False
+	return ok
+		
+def graphics_start():
+	stdscr = curses.initscr()
+	curses.noecho()
+	curses.cbreak()
+	stdscr.keypad(1)
+	return stdscr
+
+def graphics_end(stdscr):
+	curses.nocbreak()
+	stdscr.keypad(0)
+	curses.echo()
+	curses.endwin()
+	
+def format_elapse_time(seconds):
+	elapse = time.strftime('%H:%M:%S', time.gmtime(seconds))
+	if seconds >= 24 * 3600:
+		elapse = '%dd %s' % (seconds / (24 * 3600), elapse)
+	return elapse
+	
+def graphics_drawer(batchrun, stdscr):
+	def draw_task(pickup):
+		def draw(stdscr, top, width, height, title, tasks):
+			if len(tasks) > height - 2:
+				show = pickup(tasks, height - 2) + ['...',]
+			else:
+				show = tasks
+			
+			show = show + ['', ] * (height - 1 - len(show))
+			stdscr.addstr(top, 0, '%-*s' % (width, title), curses.A_REVERSE)
+			for i in xrange(len(show)):
+				stdscr.addstr(top + 1 + i, 0, '%-*.*s' % (width, width, show[i]))
+		return draw
+	
+	def draw():
+		try:
+			height, width = stdscr.getmaxyx()
+			if height > 8:
+				finish = int(width * (len(batchrun.success) + len(batchrun.failed)) / len(batchrun.tasks))
+			
+				show_running_num = min(max_job, height - 8)
+				show_failed_num = height - show_running_num - 6
+
+				draw_task(lambda tasks, count: tasks[:count])(
+					stdscr, 0, width, show_running_num + 2, 'RUNNING', [task.task for task in batchrun.running])
+				draw_task(lambda tasks, count: tasks[-count:])(
+					stdscr, show_running_num + 2, width, show_failed_num + 2, 'FAILED', batchrun.failed)
+				
+				elapse = format_elapse_time(batchrun.elapse())
+				summary = 'elapse: %s, total: %d, success: %d, failed: %d, running: %d, todo: %d' % (elapse, len(batchrun.tasks), len(batchrun.success), len(batchrun.failed), len(batchrun.running), len(batchrun.todo))
+				stdscr.addstr(height - 2, 0, '>' * finish + '-' * (width - finish))
+				stdsrc.addstr(height - 1, 0, '%-*.*s' % (width - 1, width - 1, summary))
+			else:
+				stdsrc.addstr(0, 0, '%-*.*s' % (width, width, 'The screen is too small.'), curses.A_REVERSE)
+			stdsrc.refresh()
+		except curses.error as exc:
+			stack = traceback.format_exc()
+			sys.stderr.write('%s\n' % stack)
+			pass
+	return draw
+	
+def lib_1st(x, y):
+	if x[:3] == 'lib' and y[:3] != 'lib':
+		return -1
+	elif y[:3] == 'lib' and x[:3] != 'lib':
+		return 1
+	else:
+		return cmp(x, y)
+
+def read_target_detail(file):
+	config = ConfigParser.ConfigParser()
+	config.read(file)
+	rules = config.items('rule')
+	def detail(d):
+		fields = d.split(',') + [''] * 7
+		return {'dep': fields[5].split(), 'gen': filter(lambda s: len(s) > 0, fields[6].split(';'))}
+	details = dict([(rule[0], detail(rule[1])) for rule in rules])
+	def sub(key):
+		return dict([(target, details[target][key]) for target in details.keys()])
+	return sub('dep'), sub('gen')
+def pickup_ssh(workspace):
+	def f(str):
+		# ssh://usr:pwd@host:port
+		pattern = '^ssh://(?:(.*?)(?::(.*))?@)?(.*?)(?::([0-9]+))?(?:/(.*))?$'
+		prog = re.compile(pattern)
+		result = prog.match(str)
+		if result:
+			usr = result.group(1)
+			pwd = result.group(2)
+			host = result.group(3)
+			port = result.group(4)
+			root = result.group(5)
+			if port == None:
+				port = 	'22'
+			if root == None:
+				root = workspace
+		return {'address': (host, int(port)), 'user': usr, 'password': pwd, 'root': root}
+	return f
+
+def get_remote_node():
+	cfg = 'dist.cfg' 
+	config = ConfigParser.ConfigParser()
+	config.read(cfg)
+
+	user = config.get('local', 'user')
+	passwd = config.get('local', 'passwd')
+	server = config.get('local', 'server')
+	workspace = config.get('remote', 'workspace')
+	nodes = config.get('remote', 'nodes').split()
+	return '%s@%s:%s' % (user, server, os.getcwd()), filter(lambda n: n != None, map(pickup_ssh(workspace), nodes))
+	
+if __name__ == '__main__':
+	logging.basicConfig(filename = 'dist_build.log', level = logging.DEBUG)
+	optparser = OptionParser('usage: %prog [options] makedir targetfile dependfile logdir')
+	optparser.add_option('-j', '--jobs', dest='jobs', help='Allow N jobs at once.')
+	optparser.add_option('-g', '--graphics', action='store_true', dest='graphics',
+			help='graphics interface.')
+	optparser.add_option('-k', '--keep-going', action='store_true', dest='keepgoing',
+			help='Keep going when some targets can\'t be made.')
+	optparser.add_option('-e', '--except', action='append', 
+			dest='except_target', default=[], help='except target')
+
+	options, args = optparser.parse_args()
+	
+	dir_make           = args[0] # '../..'
+	file_target        = args[1] # '.target'
+	file_target_detail = args[2] # ../../.rule.cfg
+	dir_log            = args[3] # 'log/%s' % time.strftime('%Y_%m_%d_%H_%M_%S', time.localtime(time.time()))
+	max_job            = int(options.jobs) # 24
+	
+	jobserver   = os.pipe()
+	os.write(jobserver[1], '+' * max_job)
+	
+	os.makedirs(dir_log)
+	
+	depend, generated = read_target_detail(file_target_detail)
+	target = read_target(open(file_target, 'r'))
+	target.sort(lib_1st)
+	target = expand_depend(target, depend)
+	target = filter(target_filter(options.except_target), target)
+
+	repo, remote = get_remote_node()
+	br = BatchRun.BatchRun(runner_poll = MakerPool(generated = generated, max_runner = max_job, repo = repo, remote = remote))
+	br.add(target)
+	for task in depend:
+		br.depend(task, depend[task])
+	
+	if options.graphics and graphics_test():
+		stdsrc = graphics_start()
+		graphics_draw = graphics_drawer(br, stdsrc)
+		br.set_drawer(graphics_draw)
+		br.run()
+		graphics_end(stdsrc)
+	else:
+		br.run()
+		
+	print ''
+	print 'BUILD REPORT:'
+	print 'Total Task     : %d' % len(br.tasks)
+	print 'Time Consuming : %s' % format_elapse_time(br.elapse())
+	print 'Successful     : %d' % len(br.success)
+	print 'Failure        : %d' % len(br.failed)
+	print '\t%s' % ' '.join(br.failed)
+	
+	exit(0 if options.keepgoing else len(br.failed))
