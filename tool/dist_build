@@ -599,12 +599,13 @@ def get_remote_node():
 	config = ConfigParser.ConfigParser()
 	config.read(cfg)
 
-	user = config.get('local', 'user')
-	passwd = config.get('local', 'passwd')
-	server = config.get('local', 'server')
+	#user = config.get('local', 'user')
+	#passwd = config.get('local', 'passwd')
+	#server = config.get('local', 'server')
+	repo = config.get('local', 'repo')
 	workspace = config.get('remote', 'workspace')
 	nodes = config.get('remote', 'nodes').split()
-	return '%s@%s:%s' % (user, server, os.getcwd()), filter(lambda n: n != None, map(pickup_ssh(workspace), nodes))
+	return repo, filter(lambda n: n != None, map(pickup_ssh(workspace), nodes))
 	
 if __name__ == '__main__':
 	logging.basicConfig(filename = 'dist_build.log', level = logging.DEBUG)
