@@ -8,7 +8,7 @@ default:clean_ws
 	@$(DIST_BUILD)  -j2 $(ROOT)  target  rule.cfg  log
 	@echo done
 $(ALL_TARGET):
-	@[ ! -d target ]  && mkdir -p target
+	@if [ ! -d target ]; then mkdir target; fi
 	@touch target/$@.target 
 	@echo $@ >  target/$@.target 
 
