@@ -8,9 +8,9 @@ default:clean_ws
 	@$(DIST_BUILD)  -j2 $(ROOT)  target  rule.cfg  log
 	@echo done
 $(ALL_TARGET):
-	@if [ ! -d target ]; then mkdir target; fi
-	@touch target/$@.target 
-	@echo $@ >  target/$@.target 
+	@if [ ! -d obj ]; then mkdir obj; fi
+	@touch obj/$@.target 
+	@echo $@ >  obj/$@.target 
 
 clean_ws:
 	@git clean -df -q
