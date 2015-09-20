@@ -1,0 +1,86 @@
+#!/usr/bin/env python
+#  -*- mode: python; -*-
+#coding=utf-8
+
+import xmlrpclib
+import multiprocessing
+import subprocess
+import os
+from SimpleXMLRPCServer import SimpleXMLRPCServer
+
+Tasks = []
+
+ROOT = None
+
+class Task:
+	def __init__(self, cmd, out_filename, err_filename):
+		self.cmd = cmd
+		self.returncode = None
+		self.out = open(out_filename, 'w')
+		self.err = open(err_filename, 'w')
+		self.process = subprocess.Popen(cmd.split(), stdout = self.out, stderr = self.err)
+		
+	def poll(self):
+		result = self.process.poll()
+		if result != None:
+			self.out.close()
+			self.err.close()
+		return result
+
+def start(cmd, out = None, err = None):
+	id = len(Tasks)
+	if not out:
+		out = 'out_%d.log' % id
+	if not err:
+		err = 'err_%d.log' % id
+	Tasks.append(Task(cmd, out, err))
+	print 'start', id, cmd
+	return id
+
+def poll(task):
+	return Tasks[task].poll()
+
+def chdir(target):
+	try:
+		os.chdir(ROOT)
+		os.chdir(target)
+		print 'chdir', os.getcwd()
+	except:
+		return -1
+	return 0
+
+def mkdir(target):
+	try:
+		if not os.path.exists(target):
+			os.makedirs(target)
+			print 'mkdir', target
+	except:
+		return -1
+	return 0
+
+def make(target, dir):
+	return 0
+	
+def version():
+	return 1
+
+def main():
+	server = SimpleXMLRPCServer(('', 8000), allow_none = True)
+	print 'Listening on port 8000...'
+	server.register_function(version, 'version')
+	server.register_function(multiprocessing.cpu_count, 'cpu_count')
+	server.register_function(start, 'start')
+	server.register_function(poll, 'poll')
+	server.register_function(chdir, 'chdir')
+	server.register_function(mkdir, 'mkdir')
+	server.register_function(make, 'make')
+	server.serve_forever()
+
+if __name__ == '__main__':
+	root = 'dist'
+	if not os.access(root, os.F_OK):
+		os.makedirs(root)
+	os.chdir(root)
+	ROOT = os.getcwd()
+	main()
+
