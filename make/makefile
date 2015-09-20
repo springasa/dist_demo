@@ -5,7 +5,7 @@ ROOT=~/test/r_dist/make
 ALL_TARGET=sdm tulip arch
 
 default:clean_ws
-	@$(DIST_BUILD)  -j2 $(ROOT)  target  rule.cfg  log
+	@$(DIST_BUILD)  -g -j2 $(ROOT)  target  rule.cfg  log
 	@echo done
 $(ALL_TARGET):
 	@if [ ! -d obj ]; then mkdir obj; fi
